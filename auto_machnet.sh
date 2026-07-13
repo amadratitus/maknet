@@ -1,5 +1,5 @@
 #!/bin/bash
-# auto_machnet.sh - One‑command Machnet deployment on Azure
+# auto_machnet.sh - One-command Machnet deployment on Azure
 # Usage: ./auto_machnet.sh
 
 set -euo pipefail
@@ -24,7 +24,7 @@ error() { echo -e "${RED}✗${NC} $1"; }
 # --------------------------------
 check_deps() {
     local missing=()
-    for cmd in docker jq curl driverctl; do
+    for cmd in docker jq curl driverctl git; do
         if ! command -v "$cmd" &>/dev/null; then
             missing+=("$cmd")
         fi
@@ -32,12 +32,31 @@ check_deps() {
     if [ ${#missing[@]} -ne 0 ]; then
         error "Missing required commands: ${missing[*]}"
         echo "Install them with:"
-        echo "  sudo apt update && sudo apt install -y docker.io jq curl driverctl"
-        echo "Then add your user to the docker group:"
-        echo "  sudo usermod -aG docker $USER && newgrp docker"
+        echo "  sudo apt update && sudo apt install -y docker.io jq curl driverctl git net-tools uuid-dev"
         exit 1
     fi
     ok "All required commands found."
+}
+
+# --------------------------------
+#  Docker access check (group membership)
+# --------------------------------
+check_docker_access() {
+    if docker info &>/dev/null; then
+        ok "Docker access OK."
+        return 0
+    fi
+
+    warn "Cannot talk to the Docker daemon (permission denied)."
+    if ! id -nG "$USER" | grep -qw docker; then
+        info "Adding $USER to the docker group..."
+        sudo usermod -aG docker "$USER"
+    fi
+    error "Docker group membership is not active in this shell session."
+    echo "Fix with ONE of the following, then re-run this script:"
+    echo "  1) Log out and SSH back in (recommended), or"
+    echo "  2) Run: sg docker -c \"export GITHUB_USER='\$GITHUB_USER' GITHUB_PAT='\$GITHUB_PAT'; $0\""
+    exit 1
 }
 
 # --------------------------------
@@ -46,7 +65,7 @@ check_deps() {
 check_github_creds() {
     if [ -z "${GITHUB_PAT:-}" ]; then
         error "GITHUB_PAT environment variable not set."
-        echo "Please export your GitHub Personal Access Token:"
+        echo "Please export your GitHub Personal Access Token (read:packages scope):"
         echo "  export GITHUB_PAT=ghp_xxxxxxxxxxxxxxxxxxxx"
         exit 1
     fi
@@ -89,13 +108,30 @@ detect_azure_nic() {
     MACHNET_IP=$(echo "$metadata" | jq -r '.network.interface[1].ipv4.ipAddress[0].privateIpAddress')
     MACHNET_MAC=$(echo "$metadata" | jq -r '.network.interface[1].macAddress' | sed 's/\(..\)/\1:/g;s/:$//')
 
-    if [ -z "$MACHNET_IP" ] || [ -z "$MACHNET_MAC" ]; then
-        error "Could not retrieve IP/MAC from Azure metadata. Are you running on Azure?"
+    if [ -z "$MACHNET_IP" ] || [ "$MACHNET_IP" == "null" ] || [ -z "$MACHNET_MAC" ]; then
+        error "Could not retrieve IP/MAC from Azure metadata. Are you running on Azure with 2 NICs?"
         exit 1
     fi
 
     ok "Machnet IP  : $MACHNET_IP"
     ok "Machnet MAC : $MACHNET_MAC"
+}
+
+# --------------------------------
+#  Allocate hugepages (required by DPDK)
+# --------------------------------
+setup_hugepages() {
+    info "Allocating hugepages for DPDK (1024 x 2MB = 2GB)..."
+    sudo sysctl -w vm.nr_hugepages=1024 >/dev/null
+
+    local hp_free
+    hp_free=$(awk '/HugePages_Free/ {print $2}' /proc/meminfo)
+    if [ "${hp_free:-0}" -lt 512 ]; then
+        error "Hugepage allocation failed or insufficient (free: ${hp_free:-0})."
+        echo "Memory may be fragmented. Try: sudo reboot, then re-run this script."
+        exit 1
+    fi
+    ok "Hugepages ready (free: $hp_free)."
 }
 
 # --------------------------------
@@ -124,9 +160,14 @@ start_machnet() {
     info "Starting Machnet sidecar (using official machnet.sh)..."
     # Ensure we are in the machnet repo directory
     if [ ! -f "machnet.sh" ]; then
-        warn "machnet.sh not found in current directory. Cloning repository..."
-        git clone --recursive https://github.com/microsoft/machnet.git
-        cd machnet
+        if [ -d "machnet" ] && [ -f "machnet/machnet.sh" ]; then
+            info "Found existing machnet repo, using it."
+            cd machnet
+        else
+            warn "machnet.sh not found in current directory. Cloning repository..."
+            git clone --recursive https://github.com/microsoft/machnet.git
+            cd machnet
+        fi
     fi
 
     # Run machnet.sh in background, redirect logs
@@ -134,9 +175,26 @@ start_machnet() {
     MACHNET_PID=$!
     info "Machnet sidecar started with PID $MACHNET_PID (logs: machnet.log)"
 
-    # Wait for it to be ready (simple sleep; could check socket)
-    sleep 5
-    ok "Machnet should be ready."
+    # Wait for the control socket to appear (up to 60s) instead of a blind sleep
+    info "Waiting for Machnet control socket..."
+    local i
+    for i in $(seq 1 60); do
+        if [ -S /var/run/machnet/machnet_ctrl.sock ]; then
+            break
+        fi
+        # If the sidecar process died early, fail immediately
+        if ! kill -0 "$MACHNET_PID" 2>/dev/null; then
+            break
+        fi
+        sleep 1
+    done
+
+    if [ ! -S /var/run/machnet/machnet_ctrl.sock ]; then
+        error "Machnet sidecar failed to start. Last 30 lines of machnet.log:"
+        tail -30 machnet.log
+        exit 1
+    fi
+    ok "Machnet is ready."
 }
 
 # --------------------------------
@@ -178,7 +236,8 @@ run_benchmark() {
                     --msg_size "$SIZE" \
                     --inflight "$INFLIGHT" \
                     --duration 30 \
-                    >> "$RESULT_FILE" 2>&1
+                    >> "$RESULT_FILE" 2>&1 \
+                    || warn "Run failed: SIZE=${SIZE} INFLIGHT=${INFLIGHT} (continuing)"
                 echo "" >> "$RESULT_FILE"
             done
         done
@@ -195,6 +254,13 @@ cleanup() {
         kill "$MACHNET_PID" 2>/dev/null || true
         wait "$MACHNET_PID" 2>/dev/null || true
     fi
+    # machnet.sh launches a Docker container; kill leaves it running. Stop it too.
+    local sidecar_containers
+    sidecar_containers=$(docker ps -q --filter "ancestor=ghcr.io/microsoft/machnet/machnet:latest" 2>/dev/null || true)
+    if [ -n "$sidecar_containers" ]; then
+        info "Stopping leftover Machnet container(s)..."
+        docker stop $sidecar_containers >/dev/null 2>&1 || true
+    fi
     ok "Cleanup done."
 }
 trap cleanup EXIT SIGINT SIGTERM
@@ -208,9 +274,11 @@ main() {
     echo -e "${BOLD}===========================================${NC}"
 
     check_deps
+    check_docker_access
     check_github_creds
     detect_azure_nic
     ensure_docker_image
+    setup_hugepages
     prepare_azure_nic
     start_machnet
 
