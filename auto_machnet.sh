@@ -236,14 +236,13 @@ run_benchmark() {
                 echo "-----------------------------------" | tee -a "$RESULT_FILE"
                 echo "SIZE=${SIZE}B, INFLIGHT=${INFLIGHT}" | tee -a "$RESULT_FILE"
                 echo "-----------------------------------" | tee -a "$RESULT_FILE"
-                $MSG_GEN \
+                timeout --signal=SIGINT 30 $MSG_GEN \
                     --local_ip "$MACHNET_IP" \
                     --remote_ip "$server_ip" \
                     --msg_size "$SIZE" \
-                    --inflight "$INFLIGHT" \
-                    --duration 30 \
+                    --msg_window "$INFLIGHT" \
                     >> "$RESULT_FILE" 2>&1 \
-                    || warn "Run failed: SIZE=${SIZE} INFLIGHT=${INFLIGHT} (continuing)"
+                    || true   # timeout exits 124 after a successful 30s run; that's expected
                 echo "" >> "$RESULT_FILE"
             done
         done
