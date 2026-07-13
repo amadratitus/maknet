@@ -170,9 +170,14 @@ start_machnet() {
         fi
     fi
 
-    # Run machnet.sh in background; detach stdin (< /dev/null) so the docker
-    # container it launches can't capture our terminal's keystrokes.
-    ./machnet.sh --mac "$MACHNET_MAC" --ip "$MACHNET_IP" < /dev/null > machnet.log 2>&1 &
+    # Remove any stale control socket from a previous run so the readiness
+    # check below can't be fooled by a dead sidecar's leftover socket.
+    sudo rm -f /var/run/machnet/machnet_ctrl.sock
+
+    # Run machnet.sh fully detached: setsid gives it a new session with NO
+    # controlling terminal, so the docker container it launches (which may
+    # use -it) can never put our terminal into raw mode or steal input.
+    setsid ./machnet.sh --mac "$MACHNET_MAC" --ip "$MACHNET_IP" < /dev/null > machnet.log 2>&1 &
     MACHNET_PID=$!
     info "Machnet sidecar started with PID $MACHNET_PID (logs: machnet.log)"
 
