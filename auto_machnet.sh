@@ -233,10 +233,12 @@ run_benchmark() {
         # Loop over message sizes and inflight counts
         for SIZE in 64 256 1024 4096; do
             for INFLIGHT in 1 16 128 512; do
-                # The sidecar can die after several client attach/detach
-                # cycles; restart it if its control socket is gone.
-                if [ ! -S /var/run/machnet/machnet_ctrl.sock ]; then
-                    warn "Sidecar died; restarting it..."
+                # The sidecar can crash during runs (esp. msg_window=512). Its
+                # socket FILE can outlive the dead process, so check whether
+                # the sidecar container is actually running, not the socket.
+                if [ -z "$(docker ps -q --filter ancestor=ghcr.io/microsoft/machnet/machnet:latest)" ]; then
+                    warn "Sidecar died; restarting it..." | tee -a "$RESULT_FILE"
+                    sudo rm -f /var/run/machnet/machnet_ctrl.sock
                     setsid ./machnet.sh --mac "$MACHNET_MAC" --ip "$MACHNET_IP" < /dev/null >> machnet.log 2>&1 &
                     MACHNET_PID=$!
                     for _w in $(seq 1 30); do
