@@ -1,5 +1,5 @@
 #!/bin/bash
-# azure.sh - Provision or tear down Azure infrastructure for Machnet replication
+# Provision or tear down Azure infrastructure for Machnet replication
 # Run this from Azure Cloud Shell (or anywhere with az CLI logged in).
 #
 # Menu:
